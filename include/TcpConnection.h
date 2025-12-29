@@ -36,6 +36,8 @@ public:
 
     bool connected() const { return state_ == kConnected; }
 
+    Buffer *inputBuffer() { return &inputBuffer_; }
+
     // 发送数据
     void send(const std::string &buf);
     void sendFile(int fileDescriptor, off_t offset, size_t count); 
@@ -53,6 +55,9 @@ public:
     { closeCallback_ = cb; }
     void setHighWaterMarkCallback(const HighWaterMarkCallback &cb, size_t highWaterMark)
     { highWaterMarkCallback_ = cb; highWaterMark_ = highWaterMark; }
+
+    // 专门给协程用的读回调设置
+    void setCoReadCallback(std::function<void()> cb) { coReadCallback_ = cb; }
 
     // 连接建立
     void connectEstablished();
@@ -95,6 +100,9 @@ private:
     WriteCompleteCallback writeCompleteCallback_; // 消息发送完成以后的回调
     HighWaterMarkCallback highWaterMarkCallback_; // 高水位回调
     CloseCallback closeCallback_; // 关闭连接的回调
+
+    std::function<void()> coReadCallback_; // 存储协程的 resume 动作
+
     size_t highWaterMark_; // 高水位阈值
 
     // 数据缓冲区
