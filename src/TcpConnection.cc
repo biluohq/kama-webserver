@@ -174,15 +174,42 @@ void TcpConnection::connectDestroyed()
 // 读是相对服务器而言的 当对端客户端有数据到达 服务器端检测到EPOLLIN 就会触发该fd上的回调 handleRead取读走对端发来的数据
 void TcpConnection::handleRead(Timestamp receiveTime)
 {
+    // [调试] 确认 Epoll 是否真的触发了
+    LOG_DEBUG << "handleRead called! fd=" << channel_->fd();
+
     int savedErrno = 0;
     ssize_t n = inputBuffer_.readFd(channel_->fd(), &savedErrno);
+
+    LOG_DEBUG << "readFd returned n=" << n; // [调试] 读到了多少字节？
+
     if (n > 0) // 有数据到达
     {
         if (coReadCallback_)
         {
+            // LOG_DEBUG << "Waking up coroutine"; // [调试] 唤醒协程
+
+            // LOG_DEBUG << "Executing coReadCallback_";
+            // coReadCallback_();
+            // LOG_DEBUG << "set coReadCallback_ to nullptr";
+            // coReadCallback_ = nullptr; // 执行完后清空
+
+            // 1. 先把成员变量里的回调取出来放到局部变量
+            auto cb = coReadCallback_;
+
+            // 2. [关键] 在执行之前，先把成员变量置空！
+            // 这样就腾出了位置。如果 cb() 内部（协程）又设置了新回调，
+            // 它会写入 coReadCallback_，而且不会被后续代码覆盖。
+            LOG_DEBUG << "set coReadCallback_ to nullptr";
+            coReadCallback_ = nullptr;
+
             // 如果设置了协程的读回调 就执行协程的resume操作
-            coReadCallback_();
-            coReadCallback_ = nullptr; // 执行完后清空
+            LOG_DEBUG << "Executing coReadCallback_";
+            // 3. 执行回调（唤醒协程）
+            cb();
+            LOG_DEBUG << "coReadCallback_ executed.";
+        }
+        else{
+            LOG_DEBUG << "No callback set! Data is sitting in buffer."; // [调试] 没有回调设置！数据正停留在缓冲区。
         }
         // else{
         //     // 已建立连接的用户有可读事件发生了 调用用户传入的回调操作onMessage shared_from_this就是获取了TcpConnection的智能指针
@@ -219,12 +246,21 @@ void TcpConnection::handleWrite()
             if (outputBuffer_.readableBytes() == 0)
             {
                 channel_->disableWriting();
-                if (writeCompleteCallback_)
+                // === 修改开始 ===
+                // 1. 如果有协程在等待缓冲区排空，优先唤醒协程
+                if (coWriteCompleteCallback_)
                 {
-                    // TcpConnection对象在其所在的subloop中 向pendingFunctors_中加入回调
-                    loop_->queueInLoop(
-                        std::bind(writeCompleteCallback_, shared_from_this()));
+                    auto cb = coWriteCompleteCallback_;
+                    coWriteCompleteCallback_ = nullptr; // 避免重复调用
+                    cb();
                 }
+                // // 2. 否则执行旧的回调逻辑 (保持兼容性)
+                // else if (writeCompleteCallback_)
+                // {
+                //     loop_->queueInLoop(
+                //         std::bind(writeCompleteCallback_, shared_from_this()));
+                // }
+                // === 修改结束 ===
                 if (state_ == kDisconnecting)
                 {
                     shutdownInLoop(); // 在当前所属的loop中把TcpConnection删除掉

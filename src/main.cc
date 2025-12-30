@@ -9,31 +9,68 @@
 #include "memoryPool.h"
 #include "CoroutineSupport.h"
 
-// 一个处理连接的协程函数
-Task connectionHandler(std::shared_ptr<TcpConnection> conn)
+/**
+ * [新增] 协程业务处理函数
+ * 替代了原来的 onMessage 回调
+ */
+Task sessionHandler(std::shared_ptr<TcpConnection> conn)
 {
-    // 这里的 conn 会被协程帧持有，保证连接不释放
-    LOG_INFO << "Coroutine handler started for " << conn->name();
+    // 保持连接引用，防止协程挂起期间连接析构
+    LOG_INFO << "Coroutine session started for " << conn->name();
 
     try
     {
         while (conn->connected())
         {
-            // [核心] 像同步代码一样等待数据！
-            // 此时代码会在这里“暂停”，直到有数据到达，而且不会阻塞线程
+            LOG_INFO << "Waiting for data..."; // [1] 挂起前
+            // 1. [读] 挂起协程等待数据 (替代 onMessage)
             Buffer *buf = co_await asyncRead(conn);
-
-            // 代码恢复执行，处理数据
             std::string msg = buf->retrieveAllAsString();
-            LOG_INFO << "Recv: " << msg;
+            LOG_INFO << "Received: " << msg; // [2] 唤醒后
+            
+            if (msg.empty())
+                continue;
 
-            // 回声服务：发回去
-            conn->send(msg);
+            // 2. [业务逻辑] 判断是否请求大数据测试
+            // 如果收到 "load"，则发送 100MB 数据进行压力测试
+            if (msg.size() >= 4 && msg.substr(0, 4) == "load")
+            {
+                LOG_INFO << "Start sending 100MB big data...";
+
+                // 构造 1MB 的数据块
+                std::string chunk(1024 * 1024, 'X');
+                int totalChunks = 100; // 总共发 100MB
+
+                for (int i = 0; i < totalChunks; ++i)
+                {
+                    if (!conn->connected())
+                        break;
+
+                    conn->send(chunk); // 非阻塞发送，写入应用层 Buffer
+
+                    // 3. [写] 大数据流控核心逻辑
+                    // 检查输出缓冲区：如果积压超过 10MB (高水位)，挂起协程等待排空
+                    if (conn->outputBuffer()->readableBytes() > 10 * 1024 * 1024)
+                    {
+                        // LOG_DEBUG << "Buffer high (" << conn->outputBuffer()->readableBytes()
+                        //           << "), waiting for drain...";
+
+                        // 挂起！直到内核把数据发完，触发 WriteComplete 回调唤醒此协程
+                        co_await asyncDrain(conn);
+                    }
+                }
+                LOG_INFO << "Finished sending big data.";
+            }
+            else
+            {
+                // 3. [普通逻辑] 简单的 Echo 回显
+                conn->send(msg);
+            }
         }
     }
     catch (...)
     {
-        LOG_ERROR << "Coroutine exception";
+        LOG_ERROR << "Coroutine exception or connection closed";
     }
 }
 
@@ -45,7 +82,9 @@ public:
     EchoServer(EventLoop *loop, const InetAddress &addr, const std::string &name)
         : server_(loop, addr, name), loop_(loop)
     {
+        LOG_DEBUG << "EchoServer started";
         // 注册回调函数
+        LOG_DEBUG << "Setting connection callback";
         server_.setConnectionCallback(
             std::bind(&EchoServer::onConnection, this, std::placeholders::_1));
 
@@ -63,6 +102,7 @@ public:
     }
     void start()
     {
+        LOG_DEBUG << "Starting EchoServer";
         server_.start();
     }
 
@@ -73,7 +113,8 @@ private:
         if (conn->connected())
         {
             LOG_INFO << "Connection UP :" << conn->peerAddress().toIpPort().c_str();
-            connectionHandler(conn);
+            // [修改] 连接建立成功，启动协程接管该连接
+            sessionHandler(conn);
         }
         else
         {
@@ -126,7 +167,7 @@ int main(int argc, char *argv[])
     KamaCache::KLfuCache<int, std::string> lfu(CAPACITY);
     // 第三步启动底层网络模块
     EventLoop loop;
-    InetAddress addr(8080, "0.0.0.0");
+    InetAddress addr(8080);
     EchoServer server(&loop, addr, "EchoServer");
     server.start();
     // 主loop开始事件循环  epoll_wait阻塞 等待就绪事件(主loop只注册了监听套接字的fd，所以只会处理新连接事件)

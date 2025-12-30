@@ -9,6 +9,7 @@
 #include "Callbacks.h"
 #include "Buffer.h"
 #include "Timestamp.h"
+#include "Logger.h"
 
 class Channel;
 class EventLoop;
@@ -37,6 +38,9 @@ public:
     bool connected() const { return state_ == kConnected; }
 
     Buffer *inputBuffer() { return &inputBuffer_; }
+    // [新增] 1. 暴露 outputBuffer 给 Awaiter 检查状态
+    Buffer *outputBuffer() { return &outputBuffer_; }
+    Channel *channel() { return channel_.get(); }
 
     // 发送数据
     void send(const std::string &buf);
@@ -57,7 +61,17 @@ public:
     { highWaterMarkCallback_ = cb; highWaterMark_ = highWaterMark; }
 
     // 专门给协程用的读回调设置
-    void setCoReadCallback(std::function<void()> cb) { coReadCallback_ = cb; }
+    // [修改] 增加日志监控
+    void setCoReadCallback(std::function<void()> cb)
+    {
+        LOG_DEBUG << "setCoReadCallback called. Callback is " << (cb ? "VALID" : "NULL");
+        coReadCallback_ = cb;
+    }
+    // [新增] 2. 设置协程的 WriteComplete 回调
+    void setCoWriteCompleteCallback(std::function<void()> cb) { coWriteCompleteCallback_ = cb; }
+
+    // 判断输出缓冲区是否拥堵
+    bool isOutputBufferHigh() { return outputBuffer_.readableBytes() > highWaterMark_; }
 
     // 连接建立
     void connectEstablished();
@@ -102,6 +116,8 @@ private:
     CloseCallback closeCallback_; // 关闭连接的回调
 
     std::function<void()> coReadCallback_; // 存储协程的 resume 动作
+    // [新增] 3. 存储唤醒协程的函数
+    std::function<void()> coWriteCompleteCallback_;
 
     size_t highWaterMark_; // 高水位阈值
 
