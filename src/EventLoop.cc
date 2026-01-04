@@ -8,6 +8,7 @@
 #include <Logger.h>
 #include <Channel.h>
 #include <Poller.h>
+#include "TimerQueue.h"
 
 // 防止一个线程创建多个EventLoop
 thread_local EventLoop *t_loopInThisThread = nullptr;
@@ -73,6 +74,30 @@ EventLoop::~EventLoop()
     t_loopInThisThread = nullptr;
 }
 
+// ================= 定时器接口实现 =================
+
+TimerId EventLoop::runAt(Timestamp time, Functor cb)
+{
+    return timerQueue_->addTimer(std::move(cb), time, 0.0);
+}
+
+TimerId EventLoop::runAfter(double delay, Functor cb)
+{
+    Timestamp time(addTime(Timestamp::now(), delay));
+    return runAt(time, std::move(cb));
+}
+
+TimerId EventLoop::runEvery(double interval, Functor cb)
+{
+    Timestamp time(addTime(Timestamp::now(), interval));
+    return timerQueue_->addTimer(std::move(cb), time, interval);
+}
+
+void EventLoop::cancel(TimerId timerId)
+{
+    return timerQueue_->cancel(timerId);
+}
+
 // 开启事件循环
 void EventLoop::loop()
 {
@@ -131,7 +156,7 @@ void EventLoop::runInLoop(Functor cb)
     }
     else // 在非当前EventLoop线程中执行cb，就需要唤醒EventLoop所在线程执行cb
     {
-        queueInLoop(cb);
+        queueInLoop(std::move(cb));
     }
 }
 
@@ -140,7 +165,7 @@ void EventLoop::queueInLoop(Functor cb)
 {
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        pendingFunctors_.emplace_back(cb);
+        pendingFunctors_.emplace_back(std::move(cb));
     }
 
     /**

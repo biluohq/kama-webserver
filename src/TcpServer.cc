@@ -28,9 +28,9 @@ TcpServer::TcpServer(EventLoop *loop,
     , nextConnId_(1)
     , started_(0)
 {
-    // 当有新用户连接时，Acceptor类中绑定的acceptChannel_会有读事件发生，执行handleRead()调用TcpServer::newConnection回调
-    acceptor_->setNewConnectionCallback(
-        std::bind(&TcpServer::newConnection, this, std::placeholders::_1, std::placeholders::_2));
+    // // 当有新用户连接时，Acceptor类中绑定的acceptChannel_会有读事件发生，执行handleRead()调用TcpServer::newConnection回调
+    // acceptor_->setNewConnectionCallback(
+    //     std::bind(&TcpServer::newConnection, this, std::placeholders::_1, std::placeholders::_2));
 }
 
 TcpServer::~TcpServer()
@@ -58,12 +58,52 @@ void TcpServer::start()
     if (started_.fetch_add(1) == 0)    // 防止一个TcpServer对象被start多次
     {
         threadPool_->start(threadInitCallback_);    // 启动底层的loop线程池
-        loop_->runInLoop(std::bind(&Acceptor::listen, acceptor_.get()));
+        loop_->runInLoop([this](){
+            acceptor_->listen();
+            // [新增] 启动 Accept 协程
+            acceptLoop(); 
+        });
+    }
+}
+
+// [新增] Accept 协程：永不停止的循环
+Task TcpServer::acceptLoop()
+{
+    LOG_INFO << "AcceptLoop coroutine started";
+
+    // 只要服务器在运行
+    while (true)
+    {
+        // 1. [挂起] 等待新连接
+        // 这一步会把协程句柄注册到 Acceptor 的 Channel 里
+        auto [connfd, peerAddr, err] = co_await acceptor_->accept();
+
+        // 2. [恢复] 收到新连接
+        if (connfd >= 0)
+        {
+            if (started_ > 0) // 简单的运行状态检查
+            {
+                handleNewConnection(connfd, peerAddr);
+            }
+            else
+            {
+                ::close(connfd);
+            }
+        }
+        else
+        {
+            LOG_ERROR << "accept error: " << err;
+            // 可以在这里处理 EMFILE (文件描述符耗尽) 等情况
+            if (err == EMFILE)
+            {
+                ::sleep(1); // 简单的缓流策略
+            }
+        }
     }
 }
 
 // 有一个新用户连接，acceptor会执行这个回调操作，负责将mainLoop接收到的请求连接(acceptChannel_会有读事件发生)通过回调轮询分发给subLoop去处理
-void TcpServer::newConnection(int sockfd, const InetAddress &peerAddr)
+void TcpServer::handleNewConnection(int sockfd, const InetAddress &peerAddr)
 {
    // 轮询算法 选择一个subLoop 来管理connfd对应的channel
     EventLoop *ioLoop = threadPool_->getNextLoop();
@@ -90,10 +130,7 @@ void TcpServer::newConnection(int sockfd, const InetAddress &peerAddr)
                                             localAddr,
                                             peerAddr));
     connections_[connName] = conn;
-    // 下面的回调都是用户设置给TcpServer => TcpConnection的，至于Channel绑定的则是TcpConnection设置的四个，handleRead,handleWrite... 这下面的回调用于handlexxx函数中
     conn->setConnectionCallback(connectionCallback_);
-    conn->setMessageCallback(messageCallback_);
-    conn->setWriteCompleteCallback(writeCompleteCallback_);
 
     // 设置了如何关闭连接的回调
     conn->setCloseCallback(

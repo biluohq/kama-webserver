@@ -23,8 +23,18 @@ Task sessionHandler(std::shared_ptr<TcpConnection> conn)
         while (conn->connected())
         {
             LOG_INFO << "Waiting for data..."; // [1] 挂起前
-            // 1. [读] 挂起协程等待数据 (替代 onMessage)
-            Buffer *buf = co_await asyncRead(conn);
+            // [新用法] 直接调用成员函数 co_await conn->read()
+            Buffer *buf = co_await conn->read();
+
+            // 如果连接断开且没数据，buf 可能为空或 readableBytes 为 0
+            if (buf->readableBytes() == 0)
+            {
+                if (conn->disconnected())
+                    break;
+                // 可能是虚假唤醒，继续等待
+                continue;
+            }
+
             std::string msg = buf->retrieveAllAsString();
             LOG_INFO << "Received: " << msg; // [2] 唤醒后
             
@@ -39,7 +49,7 @@ Task sessionHandler(std::shared_ptr<TcpConnection> conn)
 
                 // 构造 1MB 的数据块
                 std::string chunk(1024 * 1024, 'X');
-                int totalChunks = 100; // 总共发 100MB
+                int totalChunks = 1; // 总共发 1MB
 
                 for (int i = 0; i < totalChunks; ++i)
                 {
@@ -56,7 +66,7 @@ Task sessionHandler(std::shared_ptr<TcpConnection> conn)
                         //           << "), waiting for drain...";
 
                         // 挂起！直到内核把数据发完，触发 WriteComplete 回调唤醒此协程
-                        co_await asyncDrain(conn);
+                        co_await conn->drain();
                     }
                 }
                 LOG_INFO << "Finished sending big data.";
@@ -88,15 +98,6 @@ public:
         server_.setConnectionCallback(
             std::bind(&EchoServer::onConnection, this, std::placeholders::_1));
 
-        // server_.setMessageCallback(
-        //     std::bind(&EchoServer::onMessage, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-
-        // server_.setConnectionCallback([](const TcpConnectionPtr& conn) {
-        //     if (conn->connected()) {
-        //         // 连接建立时，启动一个协程来专门处理这个连接
-        //         connectionHandler(conn);
-        //     }
-        // });
         // 设置合适的subloop线程数量
         server_.setThreadNum(3);
     }

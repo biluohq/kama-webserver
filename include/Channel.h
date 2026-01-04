@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <coroutine> // [新增]
 
 #include "noncopyable.h"
 #include "Timestamp.h"
@@ -29,6 +30,11 @@ public:
     void setWriteCallback(EventCallback cb) { writeCallback_ = std::move(cb); }
     void setCloseCallback(EventCallback cb) { closeCallback_ = std::move(cb); }
     void setErrorCallback(EventCallback cb) { errorCallback_ = std::move(cb); }
+
+    // [新增] 协程设置接口
+    // 直接接管 Read 事件，优先级高于 ReadCallback
+    void setReadCoroutine(std::coroutine_handle<> h) { readCoroutine_ = h; }
+    void clearReadCoroutine() { readCoroutine_ = nullptr; }
 
     // 防止当channel被手动remove掉 channel还在执行回调操作
     void tie(const std::shared_ptr<void> &);
@@ -69,6 +75,7 @@ private:
     int events_;      // 注册fd感兴趣的事件
     int revents_;     // Poller返回的具体发生的事件
     int index_;
+    bool logHup_;
 
     std::weak_ptr<void> tie_;
     bool tied_;
@@ -78,4 +85,7 @@ private:
     EventCallback writeCallback_;
     EventCallback closeCallback_;
     EventCallback errorCallback_;
+
+    // [新增] 协程句柄
+    std::coroutine_handle<> readCoroutine_ = nullptr;
 };

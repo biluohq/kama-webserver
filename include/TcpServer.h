@@ -18,6 +18,7 @@
 #include "Callbacks.h"
 #include "TcpConnection.h"
 #include "Buffer.h"
+#include "CoroutineSupport.h" // 必须包含 Task 定义
 
 // 对外的服务器编程使用的类
 class TcpServer
@@ -52,9 +53,14 @@ public:
     void start();
 
 private:
-    void newConnection(int sockfd, const InetAddress &peerAddr);
+    // void newConnection(int sockfd, const InetAddress &peerAddr);
+    // 改为普通的内部函数供协程调用
+    void handleNewConnection(int sockfd, const InetAddress &peerAddr);
     void removeConnection(const TcpConnectionPtr &conn);
     void removeConnectionInLoop(const TcpConnectionPtr &conn);
+
+    // [新增] 专门负责 Accept 的协程
+    Task acceptLoop();
 
     using ConnectionMap = std::unordered_map<std::string, TcpConnectionPtr>;
 

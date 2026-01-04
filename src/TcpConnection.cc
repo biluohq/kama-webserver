@@ -29,11 +29,17 @@ TcpConnection::TcpConnection(EventLoop *loop,
                              int sockfd,
                              const InetAddress &localAddr,
                              const InetAddress &peerAddr)
-    : loop_(CheckLoopNotNull(loop)), name_(nameArg), state_(kConnecting), reading_(true), socket_(new Socket(sockfd)), channel_(new Channel(loop, sockfd)), localAddr_(localAddr), peerAddr_(peerAddr), highWaterMark_(64 * 1024 * 1024) // 64M
+    : loop_(CheckLoopNotNull(loop))
+    , name_(nameArg)
+    , state_(kConnecting)
+    , reading_(true)
+    , socket_(new Socket(sockfd))
+    , channel_(new Channel(loop, sockfd))
+    , localAddr_(localAddr)
+    , peerAddr_(peerAddr)
+    // , highWaterMark_(64 * 1024 * 1024) // 64M
 {
     // 下面给channel设置相应的回调函数 poller给channel通知感兴趣的事件发生了 channel会回调相应的回调函数
-    channel_->setReadCallback(
-        std::bind(&TcpConnection::handleRead, this, std::placeholders::_1));
     channel_->setWriteCallback(
         std::bind(&TcpConnection::handleWrite, this));
     channel_->setCloseCallback(
@@ -48,6 +54,63 @@ TcpConnection::TcpConnection(EventLoop *loop,
 TcpConnection::~TcpConnection()
 {
     LOG_INFO << "TcpConnection::dtor[" << name_.c_str() << "]at fd=" << channel_->fd() << "state=" << (int)state_;
+}
+
+// ================= ReadAwaiter 实现 =================
+
+bool TcpConnection::ReadAwaiter::await_ready() const
+{
+    // 如果缓冲区有数据，或者连接已断开，直接返回
+    return conn_->inputBuffer_.readableBytes() > 0 || !conn_->connected();
+}
+
+void TcpConnection::ReadAwaiter::await_suspend(std::coroutine_handle<> h)
+{
+    // 这里的 channel_ 是可见的，因为包含头文件了
+    conn_->channel_->setReadCoroutine(h);
+    conn_->enableReading();
+}
+
+Buffer *TcpConnection::ReadAwaiter::await_resume()
+{
+    int savedErrno = 0;
+    // 这里 channel_->fd() 也是可见的
+    ssize_t n = conn_->inputBuffer_.readFd(conn_->channel_->fd(), &savedErrno);
+
+    if (n == 0)
+    {
+        conn_->handleClose();
+    }
+    else if (n < 0)
+    {
+        errno = savedErrno;
+        LOG_ERROR << "TcpConnection::readAwaiter error";
+        conn_->handleError();
+    }
+
+    // 安全起见，清理句柄
+    conn_->channel_->clearReadCoroutine();
+
+    return &conn_->inputBuffer_;
+}
+
+// ================= DrainAwaiter 实现 =================
+
+bool TcpConnection::DrainAwaiter::await_ready() const
+{
+    return conn_->outputBuffer_.readableBytes() == 0 || !conn_->connected();
+}
+
+void TcpConnection::DrainAwaiter::await_suspend(std::coroutine_handle<> h)
+{
+    conn_->writeCoroutine_ = h;
+    // 必须开启写事件
+    conn_->enableWriting();
+}
+
+void TcpConnection::DrainAwaiter::await_resume()
+{
+    // resume 时什么都不用做，直接返回
 }
 
 void TcpConnection::send(const std::string &buf)
@@ -87,11 +150,10 @@ void TcpConnection::sendInLoop(const void *data, size_t len)
         if (nwrote >= 0)
         {
             remaining = len - nwrote;
-            if (remaining == 0 && writeCompleteCallback_)
+            // 如果写完了，且有协程在等待 drain，这通常不会发生(因为ready会跳过)，但为了健壮性
+            if (remaining == 0 && writeCoroutine_)
             {
-                // 既然在这里数据全部发送完成，就不用再给channel设置epollout事件了
-                loop_->queueInLoop(
-                    std::bind(writeCompleteCallback_, shared_from_this()));
+                // 一般不需要在这里 resume，因为 await_ready 会处理 buffer 为空的情况
             }
         }
         else // nwrote < 0
@@ -116,17 +178,10 @@ void TcpConnection::sendInLoop(const void *data, size_t len)
      **/
     if (!faultError && remaining > 0)
     {
-        // 目前发送缓冲区剩余的待发送的数据的长度
-        size_t oldLen = outputBuffer_.readableBytes();
-        if (oldLen + remaining >= highWaterMark_ && oldLen < highWaterMark_ && highWaterMarkCallback_)
-        {
-            loop_->queueInLoop(
-                std::bind(highWaterMarkCallback_, shared_from_this(), oldLen + remaining));
-        }
         outputBuffer_.append((char *)data + nwrote, remaining);
         if (!channel_->isWriting())
         {
-            channel_->enableWriting(); // 这里一定要注册channel的写事件 否则poller不会给channel通知epollout
+            channel_->enableWriting();
         }
     }
 }
@@ -171,68 +226,68 @@ void TcpConnection::connectDestroyed()
     channel_->remove(); // 把channel从poller中删除掉
 }
 
-// 读是相对服务器而言的 当对端客户端有数据到达 服务器端检测到EPOLLIN 就会触发该fd上的回调 handleRead取读走对端发来的数据
-void TcpConnection::handleRead(Timestamp receiveTime)
-{
-    // [调试] 确认 Epoll 是否真的触发了
-    LOG_DEBUG << "handleRead called! fd=" << channel_->fd();
+// // 读是相对服务器而言的 当对端客户端有数据到达 服务器端检测到EPOLLIN 就会触发该fd上的回调 handleRead取读走对端发来的数据
+// void TcpConnection::handleRead(Timestamp receiveTime)
+// {
+//     // [调试] 确认 Epoll 是否真的触发了
+//     LOG_DEBUG << "handleRead called! fd=" << channel_->fd();
 
-    int savedErrno = 0;
-    ssize_t n = inputBuffer_.readFd(channel_->fd(), &savedErrno);
+//     int savedErrno = 0;
+//     ssize_t n = inputBuffer_.readFd(channel_->fd(), &savedErrno);
 
-    LOG_DEBUG << "readFd returned n=" << n; // [调试] 读到了多少字节？
+//     LOG_DEBUG << "readFd returned n=" << n; // [调试] 读到了多少字节？
 
-    if (n > 0) // 有数据到达
-    {
-        if (coReadCallback_)
-        {
-            // LOG_DEBUG << "Waking up coroutine"; // [调试] 唤醒协程
+//     if (n > 0) // 有数据到达
+//     {
+//         if (readCoroutine_)
+//         {
+//             // LOG_DEBUG << "Waking up coroutine"; // [调试] 唤醒协程
 
-            // LOG_DEBUG << "Executing coReadCallback_";
-            // coReadCallback_();
-            // LOG_DEBUG << "set coReadCallback_ to nullptr";
-            // coReadCallback_ = nullptr; // 执行完后清空
+//             // LOG_DEBUG << "Executing coReadCallback_";
+//             // coReadCallback_();
+//             // LOG_DEBUG << "set coReadCallback_ to nullptr";
+//             // coReadCallback_ = nullptr; // 执行完后清空
 
-            // 1. 先把成员变量里的回调取出来放到局部变量
-            auto cb = coReadCallback_;
+//             // 1. 先把成员变量里的回调取出来放到局部变量
+//             auto co = readCoroutine_;
 
-            // 2. [关键] 在执行之前，先把成员变量置空！
-            // 这样就腾出了位置。如果 cb() 内部（协程）又设置了新回调，
-            // 它会写入 coReadCallback_，而且不会被后续代码覆盖。
-            LOG_DEBUG << "set coReadCallback_ to nullptr";
-            coReadCallback_ = nullptr;
+//             // 2. [关键] 在执行之前，先把成员变量置空！
+//             // 这样就腾出了位置。如果 cb() 内部（协程）又设置了新回调，
+//             // 它会写入 coReadCallback_，而且不会被后续代码覆盖。
+//             LOG_DEBUG << "set coReadCallback_ to nullptr";
+//             readCoroutine_ = nullptr;
 
-            // 如果设置了协程的读回调 就执行协程的resume操作
-            LOG_DEBUG << "Executing coReadCallback_";
-            // 3. 执行回调（唤醒协程）
-            cb();
-            LOG_DEBUG << "coReadCallback_ executed.";
-        }
-        else{
-            LOG_DEBUG << "No callback set! Data is sitting in buffer."; // [调试] 没有回调设置！数据正停留在缓冲区。
-        }
-        // else{
-        //     // 已建立连接的用户有可读事件发生了 调用用户传入的回调操作onMessage shared_from_this就是获取了TcpConnection的智能指针
-        //     messageCallback_(shared_from_this(), &inputBuffer_, receiveTime);
-        // }
-    }
-    else if (n == 0) // 客户端断开
-    {
-        handleClose();
-        if (coReadCallback_)
-        {
-            // 如果设置了协程的读回调 就执行协程的resume操作
-            coReadCallback_();
-            coReadCallback_ = nullptr; // 执行完后清空
-        }
-    }
-    else // 出错了
-    {
-        errno = savedErrno;
-        LOG_ERROR << "TcpConnection::handleRead";
-        handleError();
-    }
-}
+//             // 如果设置了协程的读回调 就执行协程的resume操作
+//             LOG_DEBUG << "Executing coReadCallback_";
+//             // 3. 执行回调（唤醒协程）
+//             co.resume();
+//             LOG_DEBUG << "coReadCallback_ executed.";
+//         }
+//         else{
+//             LOG_DEBUG << "No callback set! Data is sitting in buffer."; // [调试] 没有回调设置！数据正停留在缓冲区。
+//         }
+//         // else{
+//         //     // 已建立连接的用户有可读事件发生了 调用用户传入的回调操作onMessage shared_from_this就是获取了TcpConnection的智能指针
+//         //     messageCallback_(shared_from_this(), &inputBuffer_, receiveTime);
+//         // }
+//     }
+//     else if (n == 0) // 客户端断开
+//     {
+//         handleClose();
+//         // if (coReadCallback_)
+//         // {
+//         //     // 如果设置了协程的读回调 就执行协程的resume操作
+//         //     coReadCallback_();
+//         //     coReadCallback_ = nullptr; // 执行完后清空
+//         // }
+//     }
+//     else // 出错了
+//     {
+//         errno = savedErrno;
+//         LOG_ERROR << "TcpConnection::handleRead";
+//         handleError();
+//     }
+// }
 
 void TcpConnection::handleWrite()
 {
@@ -247,12 +302,13 @@ void TcpConnection::handleWrite()
             {
                 channel_->disableWriting();
                 // === 修改开始 ===
-                // 1. 如果有协程在等待缓冲区排空，优先唤醒协程
-                if (coWriteCompleteCallback_)
+                // [协程核心] 缓冲区已排空，唤醒等待 drain 的协程
+                if (writeCoroutine_)
                 {
-                    auto cb = coWriteCompleteCallback_;
-                    coWriteCompleteCallback_ = nullptr; // 避免重复调用
-                    cb();
+                    auto co = writeCoroutine_;
+                    writeCoroutine_ = nullptr;
+                    // LOG_DEBUG << "Resuming write coroutine";
+                    co.resume();
                 }
                 // // 2. 否则执行旧的回调逻辑 (保持兼容性)
                 // else if (writeCompleteCallback_)
@@ -284,9 +340,40 @@ void TcpConnection::handleClose()
     setState(kDisconnected);
     channel_->disableAll();
 
-    TcpConnectionPtr connPtr(shared_from_this());
-    connectionCallback_(connPtr); // 连接回调
-    closeCallback_(connPtr);      // 执行关闭连接的回调 执行的是TcpServer::removeConnection回调方法   // must be the last line
+    TcpConnectionPtr guardThis(shared_from_this());
+
+    // [新增] 清理 Channel 中的读协程
+    // Channel 本身没有像 TcpConnection 那样直接持有 handle，
+    // 但是我们需要确保如果协程还在 Channel 里挂起，它能被唤醒以退出循环
+
+    // 如果 ReadAwaiter 正在挂起，Channel::readCoroutine_ 应该是有值的
+    // 但 Channel 没有公开获取 coroutine 的接口，
+    // 不过 handleClose 被调用通常意味着：
+    // 1. readFd 返回 0 (在 await_resume 内部调用了 handleClose) -> 协程正在运行，没挂起。
+    // 2. 主动 shutdown -> 协程可能挂起。
+
+    // 我们需要一种机制来唤醒挂起的读协程（如果是被动关闭）
+    // 由于我们修改了 Channel，如果 HUP 发生，Channel 会自动 resume readCoroutine。
+    // 所以这里只要确保 Channel 里的句柄被清空即可。
+    channel_->clearReadCoroutine();
+
+    // 唤醒写协程 (保持不变)
+    if (writeCoroutine_)
+    {
+        LOG_INFO << "Resuming write coroutine on close";
+        auto co = writeCoroutine_;
+        writeCoroutine_ = nullptr;
+        co.resume();
+    }
+
+    if (connectionCallback_)
+    {
+        connectionCallback_(guardThis);
+    }
+    if (closeCallback_)
+    {
+        closeCallback_(guardThis);
+    }
 }
 
 void TcpConnection::handleError()
@@ -305,70 +392,82 @@ void TcpConnection::handleError()
     LOG_ERROR << "TcpConnection::handleError name:" << name_.c_str() << "- SO_ERROR:%" << err;
 }
 
-// 新增的零拷贝发送函数
-void TcpConnection::sendFile(int fileDescriptor, off_t offset, size_t count)
+// 辅助接口实现
+void TcpConnection::enableReading()
 {
-    if (connected())
-    {
-        if (loop_->isInLoopThread())
-        { // 判断当前线程是否是loop循环的线程
-            sendFileInLoop(fileDescriptor, offset, count);
-        }
-        else
-        { // 如果不是，则唤醒运行这个TcpConnection的线程执行Loop循环
-            loop_->runInLoop(
-                std::bind(&TcpConnection::sendFileInLoop, shared_from_this(), fileDescriptor, offset, count));
-        }
-    }
-    else
-    {
-        LOG_ERROR << "TcpConnection::sendFile - not connected";
-    }
+    if (!channel_->isReading())
+        channel_->enableReading();
+}
+void TcpConnection::enableWriting()
+{
+    if (!channel_->isWriting())
+        channel_->enableWriting();
 }
 
-// 在事件循环中执行sendfile
-void TcpConnection::sendFileInLoop(int fileDescriptor, off_t offset, size_t count)
-{
-    ssize_t bytesSent = 0;    // 发送了多少字节数
-    size_t remaining = count; // 还要多少数据要发送
-    bool faultError = false;  // 错误的标志位
+// // 新增的零拷贝发送函数
+// void TcpConnection::sendFile(int fileDescriptor, off_t offset, size_t count)
+// {
+//     if (connected())
+//     {
+//         if (loop_->isInLoopThread())
+//         { // 判断当前线程是否是loop循环的线程
+//             sendFileInLoop(fileDescriptor, offset, count);
+//         }
+//         else
+//         { // 如果不是，则唤醒运行这个TcpConnection的线程执行Loop循环
+//             loop_->runInLoop(
+//                 std::bind(&TcpConnection::sendFileInLoop, shared_from_this(), fileDescriptor, offset, count));
+//         }
+//     }
+//     else
+//     {
+//         LOG_ERROR << "TcpConnection::sendFile - not connected";
+//     }
+// }
 
-    if (state_ == kDisconnecting)
-    { // 表示此时连接已经断开就不需要发送数据了
-        LOG_ERROR << "disconnected, give up writing";
-        return;
-    }
+// // 在事件循环中执行sendfile
+// void TcpConnection::sendFileInLoop(int fileDescriptor, off_t offset, size_t count)
+// {
+//     ssize_t bytesSent = 0;    // 发送了多少字节数
+//     size_t remaining = count; // 还要多少数据要发送
+//     bool faultError = false;  // 错误的标志位
 
-    // 表示Channel第一次开始写数据或者outputBuffer缓冲区中没有数据
-    if (!channel_->isWriting() && outputBuffer_.readableBytes() == 0)
-    {
-        bytesSent = sendfile(socket_->fd(), fileDescriptor, &offset, remaining);
-        if (bytesSent >= 0)
-        {
-            remaining -= bytesSent;
-            if (remaining == 0 && writeCompleteCallback_)
-            {
-                // remaining为0意味着数据正好全部发送完，就不需要给其设置写事件的监听。
-                loop_->queueInLoop(std::bind(writeCompleteCallback_, shared_from_this()));
-            }
-        }
-        else
-        { // bytesSent < 0
-            if (errno != EWOULDBLOCK)
-            { // 如果是非阻塞没有数据返回错误这个是正常显现等同于EAGAIN，否则就异常情况
-                LOG_ERROR << "TcpConnection::sendFileInLoop";
-            }
-            if (errno == EPIPE || errno == ECONNRESET)
-            {
-                faultError = true;
-            }
-        }
-    }
-    // 处理剩余数据
-    if (!faultError && remaining > 0)
-    {
-        // 继续发送剩余数据
-        loop_->queueInLoop(
-            std::bind(&TcpConnection::sendFileInLoop, shared_from_this(), fileDescriptor, offset, remaining));
-    }
-}
+//     if (state_ == kDisconnecting)
+//     { // 表示此时连接已经断开就不需要发送数据了
+//         LOG_ERROR << "disconnected, give up writing";
+//         return;
+//     }
+
+//     // 表示Channel第一次开始写数据或者outputBuffer缓冲区中没有数据
+//     if (!channel_->isWriting() && outputBuffer_.readableBytes() == 0)
+//     {
+//         bytesSent = sendfile(socket_->fd(), fileDescriptor, &offset, remaining);
+//         if (bytesSent >= 0)
+//         {
+//             remaining -= bytesSent;
+//             if (remaining == 0 && writeCompleteCallback_)
+//             {
+//                 // remaining为0意味着数据正好全部发送完，就不需要给其设置写事件的监听。
+//                 loop_->queueInLoop(std::bind(writeCompleteCallback_, shared_from_this()));
+//             }
+//         }
+//         else
+//         { // bytesSent < 0
+//             if (errno != EWOULDBLOCK)
+//             { // 如果是非阻塞没有数据返回错误这个是正常显现等同于EAGAIN，否则就异常情况
+//                 LOG_ERROR << "TcpConnection::sendFileInLoop";
+//             }
+//             if (errno == EPIPE || errno == ECONNRESET)
+//             {
+//                 faultError = true;
+//             }
+//         }
+//     }
+//     // 处理剩余数据
+//     if (!faultError && remaining > 0)
+//     {
+//         // 继续发送剩余数据
+//         loop_->queueInLoop(
+//             std::bind(&TcpConnection::sendFileInLoop, shared_from_this(), fileDescriptor, offset, remaining));
+//     }
+// }

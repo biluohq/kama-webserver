@@ -18,6 +18,10 @@ public:
     {
     }
 
+    // [新增] 检查时间戳是否有效
+    bool valid() const { return microSecondsSinceEpoch_ > 0; }
+
+
     // 获取当前时间戳
     static Timestamp now();
     std::string toString()const;

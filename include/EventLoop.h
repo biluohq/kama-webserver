@@ -5,11 +5,14 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <coroutine> // [新增]
 
 #include "noncopyable.h"
 #include "Timestamp.h"
 #include "CurrentThread.h"
 #include "TimerQueue.h"
+#include "TimerId.h"
+
 class Channel;
 class Poller;
 
@@ -44,25 +47,86 @@ public:
 
     // 判断EventLoop对象是否在自己的线程里
     bool isInLoopThread() const { return threadId_ == CurrentThread::tid(); } // threadId_为EventLoop创建时的线程id CurrentThread::tid()为当前线程id
-    /**
-     * 定时任务相关函数
-     */
-    void runAt(Timestamp timestamp, Functor &&cb)
-    {
-        timerQueue_->addTimer(std::move(cb), timestamp, 0.0);
-    }
 
-    void runAfter(double waitTime, Functor &&cb)
-    {
-        Timestamp time(addTime(Timestamp::now(), waitTime));
-        runAt(time, std::move(cb));
-    }
+    // 定时器接口 (保留，供 Awaiter 内部使用)
+    TimerId runAt(Timestamp time, Functor cb);
+    TimerId runAfter(double delay, Functor cb);
+    TimerId runEvery(double interval, Functor cb);
+    void cancel(TimerId timerId);
 
-    void runEvery(double interval, Functor &&cb)
+    // ================== 协程调度核心接口 ==================
+
+    // 1. [Sleep Awaiter]
+    // 用法: co_await loop->sleep(1.5);
+    struct SleepAwaiter
     {
-        Timestamp timestamp(addTime(Timestamp::now(), interval));
-        timerQueue_->addTimer(std::move(cb), timestamp, interval);
-    }
+        EventLoop *loop_;
+        double delay_;
+
+        SleepAwaiter(EventLoop *loop, double delay) : loop_(loop), delay_(delay) {}
+
+        // 总是挂起
+        bool await_ready() const { return false; }
+
+        void await_suspend(std::coroutine_handle<> h)
+        {
+            // 利用现有的定时器机制，时间到了执行 resume
+            loop_->runAfter(delay_, [h]() mutable
+                            { h.resume(); });
+        }
+
+        void await_resume() {}
+    };
+
+    // 2. [Schedule Awaiter]
+    // 用法: co_await loop->schedule(); // 切换到该 Loop 线程执行
+    struct ScheduleAwaiter
+    {
+        EventLoop *loop_;
+
+        ScheduleAwaiter(EventLoop *loop) : loop_(loop) {}
+
+        // 如果已经在当前 Loop 线程，直接继续执行，不用挂起 (优化性能)
+        bool await_ready() const { return loop_->isInLoopThread(); }
+
+        void await_suspend(std::coroutine_handle<> h)
+        {
+            // 将 resume 任务放入 pendingFunctors 队列
+            // 由目标 Loop 线程在 doPendingFunctors 时执行
+            loop_->runInLoop([h]() mutable
+                             { h.resume(); });
+        }
+
+        void await_resume() {}
+    };
+
+    // 工厂方法
+    SleepAwaiter sleep(double delay) { return SleepAwaiter(this, delay); }
+    ScheduleAwaiter schedule() { return ScheduleAwaiter(this); }
+    // 别名，语义更清晰: "运行在..."
+    ScheduleAwaiter runOn() { return ScheduleAwaiter(this); }
+
+    // ====================================================
+
+    // /**
+    //  * 定时任务相关函数
+    //  */
+    // void runAt(Timestamp timestamp, Functor &&cb)
+    // {
+    //     timerQueue_->addTimer(std::move(cb), timestamp, 0.0);
+    // }
+
+    // void runAfter(double waitTime, Functor &&cb)
+    // {
+    //     Timestamp time(addTime(Timestamp::now(), waitTime));
+    //     runAt(time, std::move(cb));
+    // }
+
+    // void runEvery(double interval, Functor &&cb)
+    // {
+    //     Timestamp timestamp(addTime(Timestamp::now(), interval));
+    //     timerQueue_->addTimer(std::move(cb), timestamp, interval);
+    // }
 
 private:
     void handleRead();        // 给eventfd返回的文件描述符wakeupFd_绑定的事件回调 当wakeup()时 即有事件发生时 调用handleRead()读wakeupFd_的8字节 同时唤醒阻塞的epoll_wait
@@ -78,6 +142,7 @@ private:
     Timestamp pollRetureTime_; // Poller返回发生事件的Channels的时间点
     std::unique_ptr<Poller> poller_;
     std::unique_ptr<TimerQueue> timerQueue_;
+
     int wakeupFd_; // 作用：当mainLoop获取一个新用户的Channel 需通过轮询算法选择一个subLoop 通过该成员唤醒subLoop处理Channel
     std::unique_ptr<Channel> wakeupChannel_;
 

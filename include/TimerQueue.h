@@ -3,6 +3,7 @@
 
 #include "Timestamp.h"
 #include "Channel.h"
+#include "TimerId.h"
 
 #include <vector>
 #include <set>
@@ -19,17 +20,25 @@ public:
     ~TimerQueue();
 
     // 插入定时器（回调函数，到期时间，是否重复）
-    void addTimer(TimerCallback cb,
-                  Timestamp when,
-                  double interval);
-    
+    TimerId addTimer(TimerCallback cb,
+                     Timestamp when,
+                     double interval);
+
+    // [新增] 取消接口
+    void cancel(TimerId timerId);
+
 private:
     using Entry = std::pair<Timestamp, Timer*>; // 以时间戳作为键值获取定时器
     using TimerList = std::set<Entry>;          // 底层使用红黑树管理，自动按照时间戳进行排序
 
+    // [新增] 用于按对象地址查找定时器（支持取消）
+    using ActiveTimer = std::pair<Timer *, int64_t>;
+    using ActiveTimerSet = std::set<ActiveTimer>;
+
     // 在本loop中添加定时器
     // 线程安全
     void addTimerInLoop(Timer* timer);
+    void cancelInLoop(TimerId timerId);
 
     // 定时器读事件触发的函数
     void handleRead();
@@ -52,6 +61,11 @@ private:
     // Timer list sorted by expiration
     TimerList timers_;          // 定时器队列（内部实现是红黑树）
 
+    // [新增] 按对象地址排序（用于取消）
+    ActiveTimerSet activeTimers_;
+
+    // 正在处理过期定时器时的辅助变量
+    ActiveTimerSet cancelingTimers_;
     bool callingExpiredTimers_; // 标明正在获取超时定时器
 };
 

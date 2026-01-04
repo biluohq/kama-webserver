@@ -74,7 +74,17 @@ void Channel::handleEventWithGuard(Timestamp receiveTime)
     // 关闭
     if ((revents_ & EPOLLHUP) && !(revents_ & EPOLLIN)) // 当TcpConnection对应Channel 通过shutdown 关闭写端 epoll触发EPOLLHUP
     {
-        if (closeCallback_)
+        if (logHup_)
+        {
+            LOG_WARN << "fd = " << fd_ << " Channel::handle_event() EPOLLHUP";
+        }
+
+        // 如果有协程在等读，HUP 也应该唤醒它（让它读到 0 字节从而感知关闭）
+        if (readCoroutine_)
+        {
+            readCoroutine_.resume();
+        }
+        else if (closeCallback_)
         {
             closeCallback_();
         }
@@ -90,7 +100,12 @@ void Channel::handleEventWithGuard(Timestamp receiveTime)
     // 读
     if (revents_ & (EPOLLIN | EPOLLPRI))
     {
-        if (readCallback_)
+        // [协程优先]：直接唤醒，绕过 TcpConnection::handleRead
+        if (readCoroutine_)
+        {
+            readCoroutine_.resume();
+        }
+        else if (readCallback_)
         {
             readCallback_(receiveTime);
         }
