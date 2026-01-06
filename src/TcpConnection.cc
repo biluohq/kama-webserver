@@ -17,10 +17,12 @@
 
 static EventLoop *CheckLoopNotNull(EventLoop *loop)
 {
+    LOG_DEBUG << "CheckLoopNotNull start";
     if (loop == nullptr)
     {
         LOG_FATAL << " mainLoop is null!";
     }
+    LOG_DEBUG << "CheckLoopNotNull end";
     return loop;
 }
 
@@ -29,16 +31,10 @@ TcpConnection::TcpConnection(EventLoop *loop,
                              int sockfd,
                              const InetAddress &localAddr,
                              const InetAddress &peerAddr)
-    : loop_(CheckLoopNotNull(loop))
-    , name_(nameArg)
-    , state_(kConnecting)
-    , reading_(true)
-    , socket_(new Socket(sockfd))
-    , channel_(new Channel(loop, sockfd))
-    , localAddr_(localAddr)
-    , peerAddr_(peerAddr)
-    // , highWaterMark_(64 * 1024 * 1024) // 64M
+    : loop_(CheckLoopNotNull(loop)), name_(nameArg), state_(kConnecting), reading_(true), socket_(new Socket(sockfd)), channel_(new Channel(loop, sockfd)), localAddr_(localAddr), peerAddr_(peerAddr)
+// , highWaterMark_(64 * 1024 * 1024) // 64M
 {
+    LOG_DEBUG << "TcpConnection::TcpConnection start";
     // 下面给channel设置相应的回调函数 poller给channel通知感兴趣的事件发生了 channel会回调相应的回调函数
     channel_->setWriteCallback(
         std::bind(&TcpConnection::handleWrite, this));
@@ -49,11 +45,14 @@ TcpConnection::TcpConnection(EventLoop *loop,
 
     LOG_INFO << "TcpConnection::ctor:[" << name_.c_str() << "]at fd=" << sockfd;
     socket_->setKeepAlive(true);
+    LOG_DEBUG << "TcpConnection::TcpConnection end";
 }
 
 TcpConnection::~TcpConnection()
 {
+    LOG_DEBUG << "TcpConnection::~TcpConnection start";
     LOG_INFO << "TcpConnection::dtor[" << name_.c_str() << "]at fd=" << channel_->fd() << "state=" << (int)state_;
+    LOG_DEBUG << "TcpConnection::~TcpConnection end";
 }
 
 // ================= ReadAwaiter 实现 =================
@@ -115,6 +114,9 @@ void TcpConnection::DrainAwaiter::await_resume()
 
 void TcpConnection::send(const std::string &buf)
 {
+    LOG_DEBUG << "TcpConnection::send [" << name_.c_str()
+              << "] - data size: " << buf.size();
+
     if (state_ == kConnected)
     {
         if (loop_->isInLoopThread()) // 这种是对于单个reactor的情况 用户调用conn->send时 loop_即为当前线程
@@ -127,6 +129,7 @@ void TcpConnection::send(const std::string &buf)
                 std::bind(&TcpConnection::sendInLoop, this, buf.c_str(), buf.size()));
         }
     }
+    LOG_DEBUG << "TcpConnection::send end";
 }
 
 /**
@@ -134,6 +137,9 @@ void TcpConnection::send(const std::string &buf)
  **/
 void TcpConnection::sendInLoop(const void *data, size_t len)
 {
+    LOG_DEBUG << "TcpConnection::sendInLoop [" << name_.c_str()
+              << "] - data size: " << len;
+
     ssize_t nwrote = 0;
     size_t remaining = len;
     bool faultError = false;
@@ -184,39 +190,51 @@ void TcpConnection::sendInLoop(const void *data, size_t len)
             channel_->enableWriting();
         }
     }
+    LOG_DEBUG << "TcpConnection::sendInLoop end";
 }
 
 void TcpConnection::shutdown()
 {
+    LOG_DEBUG << "TcpConnection::shutdown [" << name_.c_str() << "]";
+
     if (state_ == kConnected)
     {
         setState(kDisconnecting);
         loop_->runInLoop(
             std::bind(&TcpConnection::shutdownInLoop, this));
     }
+    LOG_DEBUG << "TcpConnection::shutdown end";
 }
 
 void TcpConnection::shutdownInLoop()
 {
+    LOG_DEBUG << "TcpConnection::shutdownInLoop [" << name_.c_str() << "]";
+
     if (!channel_->isWriting()) // 说明当前outputBuffer_的数据全部向外发送完成
     {
         socket_->shutdownWrite();
     }
+    LOG_DEBUG << "TcpConnection::shutdownInLoop end";
 }
 
 // 连接建立
 void TcpConnection::connectEstablished()
 {
+    LOG_DEBUG << "TcpConnection::connectEstablished [" << name_.c_str() << "]";
+
     setState(kConnected);
     channel_->tie(shared_from_this());
     channel_->enableReading(); // 向poller注册channel的EPOLLIN读事件
 
     // 新连接建立 执行回调
     connectionCallback_(shared_from_this());
+    LOG_DEBUG << "TcpConnection::connectEstablished end";
 }
 // 连接销毁
 void TcpConnection::connectDestroyed()
 {
+    LOG_DEBUG << "TcpConnection::connectDestroyed [" << name_.c_str() << "]";
+
     if (state_ == kConnected)
     {
         setState(kDisconnected);
@@ -224,6 +242,7 @@ void TcpConnection::connectDestroyed()
         connectionCallback_(shared_from_this());
     }
     channel_->remove(); // 把channel从poller中删除掉
+    LOG_DEBUG << "TcpConnection::connectDestroyed end";
 }
 
 // // 读是相对服务器而言的 当对端客户端有数据到达 服务器端检测到EPOLLIN 就会触发该fd上的回调 handleRead取读走对端发来的数据
@@ -291,6 +310,8 @@ void TcpConnection::connectDestroyed()
 
 void TcpConnection::handleWrite()
 {
+    LOG_DEBUG << "TcpConnection::handleWrite [" << name_.c_str() << "]";
+
     if (channel_->isWriting())
     {
         int savedErrno = 0;
@@ -332,8 +353,8 @@ void TcpConnection::handleWrite()
     {
         LOG_ERROR << "TcpConnection fd=" << channel_->fd() << "is down, no more writing";
     }
+    LOG_DEBUG << "TcpConnection::handleWrite end";
 }
-
 void TcpConnection::handleClose()
 {
     LOG_INFO << "TcpConnection::handleClose fd=" << channel_->fd() << "state=" << (int)state_;
@@ -374,10 +395,11 @@ void TcpConnection::handleClose()
     {
         closeCallback_(guardThis);
     }
+    LOG_DEBUG << "TcpConnection::handleClose end";
 }
-
 void TcpConnection::handleError()
 {
+    LOG_DEBUG << "TcpConnection::handleError start";
     int optval;
     socklen_t optlen = sizeof optval;
     int err = 0;
@@ -390,18 +412,23 @@ void TcpConnection::handleError()
         err = optval;
     }
     LOG_ERROR << "TcpConnection::handleError name:" << name_.c_str() << "- SO_ERROR:%" << err;
+    LOG_DEBUG << "TcpConnection::handleError end";
 }
 
 // 辅助接口实现
 void TcpConnection::enableReading()
 {
+    LOG_DEBUG << "TcpConnection::enableReading start";
     if (!channel_->isReading())
         channel_->enableReading();
+    LOG_DEBUG << "TcpConnection::enableReading end";
 }
 void TcpConnection::enableWriting()
 {
+    LOG_DEBUG << "TcpConnection::enableWriting start";
     if (!channel_->isWriting())
         channel_->enableWriting();
+    LOG_DEBUG << "TcpConnection::enableWriting end";
 }
 
 // // 新增的零拷贝发送函数

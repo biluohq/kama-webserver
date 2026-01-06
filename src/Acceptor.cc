@@ -44,4 +44,5 @@ void Acceptor::listen()
     listenning_ = true;
     acceptSocket_.listen();         // listen
     // acceptChannel_.enableReading(); // acceptChannel_注册至Poller !重要
+    LOG_DEBUG << "Acceptor::listen() end";
 }

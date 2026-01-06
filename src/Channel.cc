@@ -32,8 +32,10 @@ Channel::~Channel()
  **/
 void Channel::tie(const std::shared_ptr<void> &obj)
 {
+    LOG_DEBUG << "Channel::tie start";
     tie_ = obj;
     tied_ = true;
+    LOG_DEBUG << "Channel::tie end";
 }
 //update 和remove => EpollPoller 更新channel在poller中的状态
 /**
@@ -41,18 +43,23 @@ void Channel::tie(const std::shared_ptr<void> &obj)
  **/
 void Channel::update()
 {
+    LOG_DEBUG << "Channel::update start";
     // 通过channel所属的eventloop，调用poller的相应方法，注册fd的events事件
     loop_->updateChannel(this);
+    LOG_DEBUG << "Channel::update end";
 }
 
 // 在channel所属的EventLoop中把当前的channel删除掉
 void Channel::remove()
 {
+    LOG_DEBUG << "Channel::remove start";
     loop_->removeChannel(this);
+    LOG_DEBUG << "Channel::remove end";
 }
 
 void Channel::handleEvent(Timestamp receiveTime)
 {
+    LOG_DEBUG << "Channel::handleEvent start";
     if (tied_)
     {
         std::shared_ptr<void> guard = tie_.lock();
@@ -66,6 +73,7 @@ void Channel::handleEvent(Timestamp receiveTime)
     {
         handleEventWithGuard(receiveTime);
     }
+    LOG_DEBUG << "Channel::handleEvent end";
 }
 
 void Channel::handleEventWithGuard(Timestamp receiveTime)
@@ -118,4 +126,6 @@ void Channel::handleEventWithGuard(Timestamp receiveTime)
             writeCallback_();
         }
     }
+
+    LOG_DEBUG << "Channel::handleEventWithGuard end";
 }

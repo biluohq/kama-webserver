@@ -46,7 +46,7 @@ Timestamp EPollPoller::poll(int timeoutMs, ChannelList *activeChannels)
     }
     else if (numEvents == 0)
     {
-        LOG_DEBUG<<"timeout!";
+        // LOG_DEBUG<<"timeout!";
     }
     else
     {
@@ -56,12 +56,14 @@ Timestamp EPollPoller::poll(int timeoutMs, ChannelList *activeChannels)
             LOG_ERROR<<"EPollPoller::poll() error!";
         }
     }
+    LOG_DEBUG<<"EPollPoller::poll() end";
     return now;
 }
 
 // channel update remove => EventLoop updateChannel removeChannel => Poller updateChannel removeChannel
 void EPollPoller::updateChannel(Channel *channel)
 {
+    LOG_DEBUG<<"EPollPoller::updateChannel start [fd="<<channel->fd()<<"]";
     const int index = channel->index();
     LOG_INFO<<"func =>"<<"fd"<<channel->fd()<<"events="<<channel->events()<<"index="<<index;
 
@@ -91,11 +93,13 @@ void EPollPoller::updateChannel(Channel *channel)
             update(EPOLL_CTL_MOD, channel);
         }
     }
+    LOG_DEBUG << "EPollPoller::updateChannel end [fd=" << channel->fd() << "]";
 }
 
 // 从Poller中删除channel
 void EPollPoller::removeChannel(Channel *channel)
 {
+    LOG_DEBUG<<"EPollPoller::removeChannel start [fd="<<channel->fd()<<"]";
     int fd = channel->fd();
     channels_.erase(fd);
 
@@ -107,22 +111,26 @@ void EPollPoller::removeChannel(Channel *channel)
         update(EPOLL_CTL_DEL, channel);
     }
     channel->set_index(kNew);
+    LOG_DEBUG << "EPollPoller::removeChannel end [fd=" << channel->fd() << "]";
 }
 
 // 填写活跃的连接
 void EPollPoller::fillActiveChannels(int numEvents, ChannelList *activeChannels) const
 {
+    LOG_DEBUG<<"EPollPoller::fillActiveChannels start";
     for (int i = 0; i < numEvents; ++i)
     {
         Channel *channel = static_cast<Channel *>(events_[i].data.ptr);
         channel->set_revents(events_[i].events);
         activeChannels->push_back(channel); // EventLoop就拿到了它的Poller给它返回的所有发生事件的channel列表了
     }
+    LOG_DEBUG<<"EPollPoller::fillActiveChannels end";
 }
 
 // 更新channel通道 其实就是调用epoll_ctl add/mod/del
 void EPollPoller::update(int operation, Channel *channel)
 {
+    LOG_DEBUG<<"EPollPoller::update start [operation="<<operation<<"] "<<"fd="<<channel->fd();
     epoll_event event;
     ::memset(&event, 0, sizeof(event));
 
@@ -143,4 +151,5 @@ void EPollPoller::update(int operation, Channel *channel)
             LOG_FATAL<<"epoll_ctl add/mod error:"<<errno;
         }
     }
+    LOG_DEBUG << "EPollPoller::update end [operation=" << operation << "] " << "fd=" << channel->fd();
 }

@@ -99,7 +99,7 @@ public:
             std::bind(&EchoServer::onConnection, this, std::placeholders::_1));
 
         // 设置合适的subloop线程数量
-        server_.setThreadNum(3);
+        server_.setThreadNum(1);
     }
     void start()
     {

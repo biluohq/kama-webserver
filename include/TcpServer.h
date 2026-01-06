@@ -40,8 +40,8 @@ public:
 
     void setThreadInitCallback(const ThreadInitCallback &cb) { threadInitCallback_ = cb; }
     void setConnectionCallback(const ConnectionCallback &cb) { connectionCallback_ = cb; }
-    void setMessageCallback(const MessageCallback &cb) { messageCallback_ = cb; }
-    void setWriteCompleteCallback(const WriteCompleteCallback &cb) { writeCompleteCallback_ = cb; }
+    // void setMessageCallback(const MessageCallback &cb) { messageCallback_ = cb; }
+    // void setWriteCompleteCallback(const WriteCompleteCallback &cb) { writeCompleteCallback_ = cb; }
 
     // 设置底层subloop的个数
     void setThreadNum(int numThreads);

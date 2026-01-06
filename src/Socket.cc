@@ -16,22 +16,30 @@ Socket::~Socket()
 
 void Socket::bindAddress(const InetAddress &localaddr)
 {
+    LOG_DEBUG<<"Socket::bindAddress()";
+
     if (0 != ::bind(sockfd_, (sockaddr *)localaddr.getSockAddr(), sizeof(sockaddr_in)))
     {
         LOG_FATAL<<"bind sockfd:"<<sockfd_ <<"fail";
     }
+    LOG_DEBUG<<"Socket::bindAddress() end";
 }
 
 void Socket::listen()
 {
+    LOG_DEBUG<<"Socket::listen()";
+
     if (0 != ::listen(sockfd_, 1024))
     {
         LOG_FATAL<<"bind sockfd:"<<sockfd_ <<"fail";
     }
+    LOG_DEBUG<<"Socket::listen() end";
 }
 
 int Socket::accept(InetAddress *peeraddr)
 {
+    LOG_DEBUG<<"Socket::accept()";
+
     /**
      * 1. accept函数的参数不合法
      * 2. 对返回的connfd没有设置非阻塞
@@ -47,15 +55,19 @@ int Socket::accept(InetAddress *peeraddr)
     {
         peeraddr->setSockAddr(addr);
     }
+    LOG_DEBUG<<"Socket::accept() end";
     return connfd;
 }
 
 void Socket::shutdownWrite()
 {
+    LOG_DEBUG<<"Socket::shutdownWrite()";
+
     if (::shutdown(sockfd_, SHUT_WR) < 0)
     {
         LOG_ERROR<<"shutdownWrite error";
     }
+    LOG_DEBUG<<"Socket::shutdownWrite() end";
 }
 
 void Socket::setTcpNoDelay(bool on)

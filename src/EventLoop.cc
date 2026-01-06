@@ -35,10 +35,12 @@ const int kPollTimeMs = 10000; // 10000毫秒 = 10秒钟
 int createEventfd()
 {
     int evtfd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    LOG_DEBUG << "createEventfd() start [evtfd=" << evtfd << "]";
     if (evtfd < 0)
     {
         LOG_FATAL<<"eventfd error:%d"<<errno;
     }
+    LOG_DEBUG << "createEventfd() end [evtfd=" << evtfd << "]";
     return evtfd;
 }
 
@@ -51,7 +53,7 @@ EventLoop::EventLoop()
     , wakeupFd_(createEventfd())
     , wakeupChannel_(new Channel(this, wakeupFd_))
 {
-    LOG_DEBUG<<"EventLoop created"<<this<<"in thread"<<threadId_;
+    LOG_DEBUG<<"EventLoop created "<<this<<" in thread"<<threadId_;
     if (t_loopInThisThread)
     {
         LOG_FATAL<<"Another EventLoop"<<t_loopInThisThread<<"exists in this thread "<<threadId_;
@@ -65,6 +67,8 @@ EventLoop::EventLoop()
         std::bind(&EventLoop::handleRead, this)); // 设置wakeupfd的事件类型以及发生事件后的回调操作
     
     wakeupChannel_->enableReading(); // 每一个EventLoop都将监听wakeupChannel_的EPOLL读事件了
+
+    LOG_DEBUG<<"EventLoop::EventLoop() end";
 }
 EventLoop::~EventLoop()
 {
@@ -104,6 +108,7 @@ void EventLoop::loop()
     looping_ = true;
     quit_ = false;
 
+    LOG_DEBUG<<"EventLoop::loop() start looping "<<this;
     LOG_INFO<<"EventLoop start looping";
 
     while (!quit_)
@@ -123,7 +128,7 @@ void EventLoop::loop()
          **/
         doPendingFunctors();
     }
-    LOG_INFO<<"EventLoopstop looping";
+    LOG_INFO<<"EventLoopstop looping "<<this;
     looping_ = false;
 }
 
@@ -150,6 +155,7 @@ void EventLoop::quit()
 // 在当前loop中执行cb
 void EventLoop::runInLoop(Functor cb)
 {
+    LOG_DEBUG<<"EventLoop::runInLoop start [cb="<<&cb<<"]";
     if (isInLoopThread()) // 当前EventLoop中执行回调
     {
         cb();
@@ -158,11 +164,13 @@ void EventLoop::runInLoop(Functor cb)
     {
         queueInLoop(std::move(cb));
     }
+    LOG_DEBUG << "EventLoop::runInLoop end [cb=" << &cb << "]";
 }
 
 // 把cb放入队列中 唤醒loop所在的线程执行cb
 void EventLoop::queueInLoop(Functor cb)
 {
+    LOG_DEBUG<<"EventLoop::queueInLoop start [cb="<<&cb<<"]";
     {
         std::unique_lock<std::mutex> lock(mutex_);
         pendingFunctors_.emplace_back(std::move(cb));
@@ -177,47 +185,59 @@ void EventLoop::queueInLoop(Functor cb)
     {
         wakeup(); // 唤醒loop所在线程
     }
+    LOG_DEBUG << "EventLoop::queueInLoop end [cb=" << &cb << "]";
 }
 
 void EventLoop::handleRead()
 {
+    LOG_DEBUG<<"EventLoop::handleRead() start";
     uint64_t one = 1;
     ssize_t n = read(wakeupFd_, &one, sizeof(one));
     if (n != sizeof(one))
     {
         LOG_ERROR<<"EventLoop::handleRead() reads"<<n<<"bytes instead of 8";
     }
+    LOG_DEBUG << "EventLoop::handleRead() end";
 }
 
 // 用来唤醒loop所在线程 向wakeupFd_写一个数据 wakeupChannel就发生读事件 当前loop线程就会被唤醒
 void EventLoop::wakeup()
 {
+    LOG_DEBUG<<"EventLoop::wakeup() start";
     uint64_t one = 1;
     ssize_t n = write(wakeupFd_, &one, sizeof(one));
     if (n != sizeof(one))
     {
         LOG_ERROR<<"EventLoop::wakeup() writes"<<n<<"bytes instead of 8";
     }
+    LOG_DEBUG << "EventLoop::wakeup() end";
 }
 
 // EventLoop的方法 => Poller的方法
 void EventLoop::updateChannel(Channel *channel)
 {
+    LOG_DEBUG<<"EventLoop::updateChannel start [fd="<<channel->fd()<<"]";
     poller_->updateChannel(channel);
+    LOG_DEBUG<<"EventLoop::updateChannel end [fd="<<channel->fd()<<"]";
 }
 
 void EventLoop::removeChannel(Channel *channel)
 {
+    LOG_DEBUG<<"EventLoop::removeChannel start [fd="<<channel->fd()<<"]";
     poller_->removeChannel(channel);
+    LOG_DEBUG<<"EventLoop::removeChannel end [fd="<<channel->fd()<<"]";
 }
 
 bool EventLoop::hasChannel(Channel *channel)
 {
+    LOG_DEBUG<<"EventLoop::hasChannel start [fd="<<channel->fd()<<"]";
+    LOG_DEBUG << "EventLoop::hasChannel end [fd=" << channel->fd() << "]";
     return poller_->hasChannel(channel);
 }
 
 void EventLoop::doPendingFunctors()
 {
+    LOG_DEBUG<<"EventLoop::doPendingFunctors start";
     std::vector<Functor> functors;
     callingPendingFunctors_ = true;
 
@@ -232,4 +252,5 @@ void EventLoop::doPendingFunctors()
     }
 
     callingPendingFunctors_ = false;
+    LOG_DEBUG << "EventLoop::doPendingFunctors end";
 }
