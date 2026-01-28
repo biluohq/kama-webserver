@@ -71,6 +71,36 @@ Task sessionHandler(std::shared_ptr<TcpConnection> conn)
                 }
                 LOG_INFO << "Finished sending big data.";
             }
+            // 如果收到 "sleep X"，则在协程中基于定时器挂起 X 秒，再回一条消息
+            else if (msg.size() >= 6 && msg.substr(0, 5) == "sleep")
+            {
+                double seconds = 0.0;
+                try
+                {
+                    // 允许格式："sleep 1" / "sleep 1.5" 等
+                    std::string arg = msg.substr(5);
+                    // 去掉前导空格
+                    auto firstNotSpace = arg.find_first_not_of(' ');
+                    if (firstNotSpace != std::string::npos)
+                    {
+                        arg = arg.substr(firstNotSpace);
+                        seconds = std::stod(arg);
+                    }
+                }
+                catch (...)
+                {
+                    seconds = 0.0;
+                }
+
+                if (seconds < 0.0)
+                {
+                    seconds = 0.0;
+                }
+
+                LOG_INFO << "Coroutine sleep for " << seconds << " seconds";
+                co_await asyncSleep(conn, seconds);
+                conn->send("wake up after sleep\n");
+            }
             else
             {
                 // 3. [普通逻辑] 简单的 Echo 回显
