@@ -11,6 +11,7 @@
 #include "Buffer.h"
 #include "Timestamp.h"
 #include "Logger.h"
+#include "TimerId.h"
 
 class Channel;
 class EventLoop;
@@ -51,7 +52,6 @@ public:
 
     // 发送数据
     void send(const std::string &buf);
-    // void sendFile(int fileDescriptor, off_t offset, size_t count); 
     
     // 关闭半连接
     void shutdown();
@@ -87,6 +87,67 @@ public:
     // 获取写排空等待器
     DrainAwaiter drain() { return DrainAwaiter(this); }
 
+    // [SendFile Awaiter]
+    // 用法: ssize_t bytesSent = co_await conn->sendFile(fd, offset, count);
+    // 零拷贝发送文件，协程化接口
+    struct SendFileAwaiter
+    {
+        TcpConnection *conn_;
+        int fileFd_;
+        off_t offset_;
+        size_t count_;
+
+        SendFileAwaiter(TcpConnection *conn, int fileFd, off_t offset, size_t count)
+            : conn_(conn), fileFd_(fileFd), offset_(offset), count_(count) {}
+
+        bool await_ready() const;
+        void await_suspend(std::coroutine_handle<> h);
+        ssize_t await_resume();
+    };
+
+    // 获取 sendFile 等待器
+    SendFileAwaiter sendFile(int fileFd, off_t offset, size_t count)
+    {
+        return SendFileAwaiter(this, fileFd, offset, count);
+    }
+
+    // [ReadWithTimeout Awaiter]
+    // 用法: auto [buf, timedOut] = co_await conn->readWithTimeout(30.0);
+    // 带超时的异步读取，防止客户端恶意挂起
+    struct ReadResult
+    {
+        Buffer *buffer;
+        bool timedOut;
+    };
+
+    struct ReadWithTimeoutAwaiter
+    {
+        // 共享状态，用于协调 read 事件和 timer 回调
+        struct State
+        {
+            std::coroutine_handle<> handle;
+            std::atomic<bool> resumed{false};
+            bool timedOut = false;
+            TimerId timerId;
+        };
+
+        TcpConnection *conn_;
+        double timeoutSecs_;
+        std::shared_ptr<State> state_;
+
+        ReadWithTimeoutAwaiter(TcpConnection *conn, double timeoutSecs)
+            : conn_(conn), timeoutSecs_(timeoutSecs), state_(std::make_shared<State>()) {}
+
+        bool await_ready() const;
+        void await_suspend(std::coroutine_handle<> h);
+        ReadResult await_resume();
+    };
+
+    ReadWithTimeoutAwaiter readWithTimeout(double timeoutSecs)
+    {
+        return ReadWithTimeoutAwaiter(this, timeoutSecs);
+    }
+
     // ================================================
 
     void setConnectionCallback(const ConnectionCallback &cb)
@@ -121,7 +182,6 @@ private:
 
     void sendInLoop(const void *data, size_t len);
     void shutdownInLoop();
-    // void sendFileInLoop(int fileDescriptor, off_t offset, size_t count);
     EventLoop *loop_; // 这里是baseloop还是subloop由TcpServer中创建的线程数决定 若为多Reactor 该loop_指向subloop 若为单Reactor 该loop_指向baseloop
     const std::string name_;
     std::atomic_int state_;
@@ -141,6 +201,11 @@ private:
 
     // 协程句柄 (取代了 std::function 回调)
     std::coroutine_handle<> writeCoroutine_ = nullptr;
+
+    int sendFileFd_ = -1;
+    off_t sendFileOffset_ = 0;
+    size_t sendFileRemaining_ = 0;
+    ssize_t sendFileBytesSent_ = 0;
 
     // 数据缓冲区
     Buffer inputBuffer_;    // 接收数据的缓冲区

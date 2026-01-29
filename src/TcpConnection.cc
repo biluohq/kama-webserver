@@ -112,6 +112,132 @@ void TcpConnection::DrainAwaiter::await_resume()
     // resume 时什么都不用做，直接返回
 }
 
+// ================= SendFileAwaiter 实现 =================
+
+bool TcpConnection::SendFileAwaiter::await_ready() const
+{
+    return count_ == 0 || !conn_->connected();
+}
+
+void TcpConnection::SendFileAwaiter::await_suspend(std::coroutine_handle<> h)
+{
+    conn_->sendFileFd_ = fileFd_;
+    conn_->sendFileOffset_ = offset_;
+    conn_->sendFileRemaining_ = count_;
+    conn_->sendFileBytesSent_ = 0;
+    conn_->writeCoroutine_ = h;
+
+    if (!conn_->channel_->isWriting() && conn_->outputBuffer_.readableBytes() == 0)
+    {
+        ssize_t n = ::sendfile(conn_->socket_->fd(), fileFd_, &conn_->sendFileOffset_, conn_->sendFileRemaining_);
+        if (n > 0)
+        {
+            conn_->sendFileRemaining_ -= n;
+            conn_->sendFileBytesSent_ += n;
+        }
+
+        if (conn_->sendFileRemaining_ == 0)
+        {
+            conn_->sendFileFd_ = -1;
+            conn_->writeCoroutine_ = nullptr;
+            h.resume();
+            return;
+        }
+
+        if (n < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
+        {
+            LOG_ERROR << "TcpConnection::SendFileAwaiter initial sendfile error";
+            conn_->sendFileFd_ = -1;
+            conn_->writeCoroutine_ = nullptr;
+            h.resume();
+            return;
+        }
+    }
+
+    conn_->enableWriting();
+}
+
+ssize_t TcpConnection::SendFileAwaiter::await_resume()
+{
+    ssize_t result = conn_->sendFileBytesSent_;
+    conn_->sendFileFd_ = -1;
+    conn_->sendFileOffset_ = 0;
+    conn_->sendFileRemaining_ = 0;
+    conn_->sendFileBytesSent_ = 0;
+    return result;
+}
+
+// ================= ReadWithTimeoutAwaiter 实现 =================
+
+bool TcpConnection::ReadWithTimeoutAwaiter::await_ready() const
+{
+    return conn_->inputBuffer_.readableBytes() > 0 || !conn_->connected();
+}
+
+void TcpConnection::ReadWithTimeoutAwaiter::await_suspend(std::coroutine_handle<> h)
+{
+    state_->handle = h;
+
+    std::weak_ptr<State> weakState = state_;
+    TcpConnection *conn = conn_;
+
+    state_->timerId = conn_->loop_->runAfter(timeoutSecs_, [weakState, conn]() {
+        auto state = weakState.lock();
+        if (!state)
+            return;
+
+        bool expected = false;
+        if (state->resumed.compare_exchange_strong(expected, true))
+        {
+            state->timedOut = true;
+            conn->channel_->clearReadResumeCallback();
+            state->handle.resume();
+        }
+    });
+
+    conn_->channel_->setReadResumeCallback([weakState, conn]() {
+        auto state = weakState.lock();
+        if (!state)
+            return;
+
+        bool expected = false;
+        if (state->resumed.compare_exchange_strong(expected, true))
+        {
+            state->timedOut = false;
+            conn->loop_->cancel(state->timerId);
+            state->handle.resume();
+        }
+    });
+
+    conn_->enableReading();
+}
+
+TcpConnection::ReadResult TcpConnection::ReadWithTimeoutAwaiter::await_resume()
+{
+    conn_->channel_->clearReadResumeCallback();
+
+    if (state_->timedOut)
+    {
+        return {&conn_->inputBuffer_, true};
+    }
+
+    int savedErrno = 0;
+    ssize_t n = conn_->inputBuffer_.readFd(conn_->channel_->fd(), &savedErrno);
+
+    if (n == 0)
+    {
+        conn_->handleClose();
+    }
+    else if (n < 0)
+    {
+        errno = savedErrno;
+        LOG_ERROR << "TcpConnection::ReadWithTimeoutAwaiter error";
+        conn_->handleError();
+    }
+
+    return {&conn_->inputBuffer_, false};
+}
+
 void TcpConnection::send(const std::string &buf)
 {
     LOG_DEBUG << "TcpConnection::send [" << name_.c_str()
@@ -314,33 +440,62 @@ void TcpConnection::handleWrite()
 
     if (channel_->isWriting())
     {
-        int savedErrno = 0;
-        ssize_t n = outputBuffer_.writeFd(channel_->fd(), &savedErrno);
-        if (n > 0)
+        if (sendFileFd_ >= 0 && sendFileRemaining_ > 0)
         {
-            outputBuffer_.retrieve(n); // 从缓冲区读取reable区域的数据移动readindex下标
-            if (outputBuffer_.readableBytes() == 0)
+            ssize_t n = ::sendfile(socket_->fd(), sendFileFd_, &sendFileOffset_, sendFileRemaining_);
+            if (n > 0)
+            {
+                sendFileRemaining_ -= n;
+                sendFileBytesSent_ += n;
+            }
+
+            if (sendFileRemaining_ == 0)
             {
                 channel_->disableWriting();
-                // === 修改开始 ===
-                // [协程核心] 缓冲区已排空，唤醒等待 drain 的协程
+                sendFileFd_ = -1;
                 if (writeCoroutine_)
                 {
                     auto co = writeCoroutine_;
                     writeCoroutine_ = nullptr;
-                    // LOG_DEBUG << "Resuming write coroutine";
                     co.resume();
                 }
-                // // 2. 否则执行旧的回调逻辑 (保持兼容性)
-                // else if (writeCompleteCallback_)
-                // {
-                //     loop_->queueInLoop(
-                //         std::bind(writeCompleteCallback_, shared_from_this()));
-                // }
-                // === 修改结束 ===
                 if (state_ == kDisconnecting)
                 {
-                    shutdownInLoop(); // 在当前所属的loop中把TcpConnection删除掉
+                    shutdownInLoop();
+                }
+            }
+            else if (n < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
+            {
+                LOG_ERROR << "TcpConnection::handleWrite sendfile error";
+                channel_->disableWriting();
+                sendFileFd_ = -1;
+                if (writeCoroutine_)
+                {
+                    auto co = writeCoroutine_;
+                    writeCoroutine_ = nullptr;
+                    co.resume();
+                }
+            }
+            return;
+        }
+
+        int savedErrno = 0;
+        ssize_t n = outputBuffer_.writeFd(channel_->fd(), &savedErrno);
+        if (n > 0)
+        {
+            outputBuffer_.retrieve(n);
+            if (outputBuffer_.readableBytes() == 0)
+            {
+                channel_->disableWriting();
+                if (writeCoroutine_)
+                {
+                    auto co = writeCoroutine_;
+                    writeCoroutine_ = nullptr;
+                    co.resume();
+                }
+                if (state_ == kDisconnecting)
+                {
+                    shutdownInLoop();
                 }
             }
         }
@@ -363,22 +518,12 @@ void TcpConnection::handleClose()
 
     TcpConnectionPtr guardThis(shared_from_this());
 
-    // [新增] 清理 Channel 中的读协程
-    // Channel 本身没有像 TcpConnection 那样直接持有 handle，
-    // 但是我们需要确保如果协程还在 Channel 里挂起，它能被唤醒以退出循环
-
-    // 如果 ReadAwaiter 正在挂起，Channel::readCoroutine_ 应该是有值的
-    // 但 Channel 没有公开获取 coroutine 的接口，
-    // 不过 handleClose 被调用通常意味着：
-    // 1. readFd 返回 0 (在 await_resume 内部调用了 handleClose) -> 协程正在运行，没挂起。
-    // 2. 主动 shutdown -> 协程可能挂起。
-
-    // 我们需要一种机制来唤醒挂起的读协程（如果是被动关闭）
-    // 由于我们修改了 Channel，如果 HUP 发生，Channel 会自动 resume readCoroutine。
-    // 所以这里只要确保 Channel 里的句柄被清空即可。
     channel_->clearReadCoroutine();
+    channel_->clearReadResumeCallback();
 
-    // 唤醒写协程 (保持不变)
+    sendFileFd_ = -1;
+    sendFileRemaining_ = 0;
+
     if (writeCoroutine_)
     {
         LOG_INFO << "Resuming write coroutine on close";
@@ -430,71 +575,3 @@ void TcpConnection::enableWriting()
         channel_->enableWriting();
     LOG_DEBUG << "TcpConnection::enableWriting end";
 }
-
-// // 新增的零拷贝发送函数
-// void TcpConnection::sendFile(int fileDescriptor, off_t offset, size_t count)
-// {
-//     if (connected())
-//     {
-//         if (loop_->isInLoopThread())
-//         { // 判断当前线程是否是loop循环的线程
-//             sendFileInLoop(fileDescriptor, offset, count);
-//         }
-//         else
-//         { // 如果不是，则唤醒运行这个TcpConnection的线程执行Loop循环
-//             loop_->runInLoop(
-//                 std::bind(&TcpConnection::sendFileInLoop, shared_from_this(), fileDescriptor, offset, count));
-//         }
-//     }
-//     else
-//     {
-//         LOG_ERROR << "TcpConnection::sendFile - not connected";
-//     }
-// }
-
-// // 在事件循环中执行sendfile
-// void TcpConnection::sendFileInLoop(int fileDescriptor, off_t offset, size_t count)
-// {
-//     ssize_t bytesSent = 0;    // 发送了多少字节数
-//     size_t remaining = count; // 还要多少数据要发送
-//     bool faultError = false;  // 错误的标志位
-
-//     if (state_ == kDisconnecting)
-//     { // 表示此时连接已经断开就不需要发送数据了
-//         LOG_ERROR << "disconnected, give up writing";
-//         return;
-//     }
-
-//     // 表示Channel第一次开始写数据或者outputBuffer缓冲区中没有数据
-//     if (!channel_->isWriting() && outputBuffer_.readableBytes() == 0)
-//     {
-//         bytesSent = sendfile(socket_->fd(), fileDescriptor, &offset, remaining);
-//         if (bytesSent >= 0)
-//         {
-//             remaining -= bytesSent;
-//             if (remaining == 0 && writeCompleteCallback_)
-//             {
-//                 // remaining为0意味着数据正好全部发送完，就不需要给其设置写事件的监听。
-//                 loop_->queueInLoop(std::bind(writeCompleteCallback_, shared_from_this()));
-//             }
-//         }
-//         else
-//         { // bytesSent < 0
-//             if (errno != EWOULDBLOCK)
-//             { // 如果是非阻塞没有数据返回错误这个是正常显现等同于EAGAIN，否则就异常情况
-//                 LOG_ERROR << "TcpConnection::sendFileInLoop";
-//             }
-//             if (errno == EPIPE || errno == ECONNRESET)
-//             {
-//                 faultError = true;
-//             }
-//         }
-//     }
-//     // 处理剩余数据
-//     if (!faultError && remaining > 0)
-//     {
-//         // 继续发送剩余数据
-//         loop_->queueInLoop(
-//             std::bind(&TcpConnection::sendFileInLoop, shared_from_this(), fileDescriptor, offset, remaining));
-//     }
-// }

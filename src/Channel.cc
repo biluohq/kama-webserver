@@ -87,8 +87,11 @@ void Channel::handleEventWithGuard(Timestamp receiveTime)
             LOG_WARN << "fd = " << fd_ << " Channel::handle_event() EPOLLHUP";
         }
 
-        // 如果有协程在等读，HUP 也应该唤醒它（让它读到 0 字节从而感知关闭）
-        if (readCoroutine_)
+        if (readResumeCallback_)
+        {
+            readResumeCallback_();
+        }
+        else if (readCoroutine_)
         {
             readCoroutine_.resume();
         }
@@ -108,8 +111,11 @@ void Channel::handleEventWithGuard(Timestamp receiveTime)
     // 读
     if (revents_ & (EPOLLIN | EPOLLPRI))
     {
-        // [协程优先]：直接唤醒，绕过 TcpConnection::handleRead
-        if (readCoroutine_)
+        if (readResumeCallback_)
+        {
+            readResumeCallback_();
+        }
+        else if (readCoroutine_)
         {
             readCoroutine_.resume();
         }

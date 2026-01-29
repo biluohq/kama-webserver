@@ -1,5 +1,7 @@
 #include <string>
 #include <coroutine>
+#include <fcntl.h>
+#include <unistd.h>
 #include <TcpServer.h>
 #include <Logger.h>
 #include <sys/stat.h>
@@ -47,29 +49,58 @@ Task sessionHandler(std::shared_ptr<TcpConnection> conn)
             {
                 LOG_INFO << "Start sending 100MB big data...";
 
-                // 构造 1MB 的数据块
                 std::string chunk(1024 * 1024, 'X');
-                int totalChunks = 1; // 总共发 1MB
+                int totalChunks = 1;
 
                 for (int i = 0; i < totalChunks; ++i)
                 {
                     if (!conn->connected())
                         break;
 
-                    conn->send(chunk); // 非阻塞发送，写入应用层 Buffer
+                    conn->send(chunk);
 
-                    // 3. [写] 大数据流控核心逻辑
-                    // 检查输出缓冲区：如果积压超过 10MB (高水位)，挂起协程等待排空
                     if (conn->outputBuffer()->readableBytes() > 10 * 1024 * 1024)
                     {
-                        // LOG_DEBUG << "Buffer high (" << conn->outputBuffer()->readableBytes()
-                        //           << "), waiting for drain...";
-
-                        // 挂起！直到内核把数据发完，触发 WriteComplete 回调唤醒此协程
                         co_await conn->drain();
                     }
                 }
                 LOG_INFO << "Finished sending big data.";
+            }
+            else if (msg.size() >= 4 && msg.substr(0, 4) == "file")
+            {
+                std::string filename = "testfile.bin";
+                if (msg.size() > 5)
+                {
+                    filename = msg.substr(5);
+                    auto pos = filename.find_first_not_of(' ');
+                    if (pos != std::string::npos)
+                        filename = filename.substr(pos);
+                    auto endpos = filename.find_last_not_of(" \r\n");
+                    if (endpos != std::string::npos)
+                        filename = filename.substr(0, endpos + 1);
+                }
+
+                int fd = ::open(filename.c_str(), O_RDONLY);
+                if (fd < 0)
+                {
+                    LOG_ERROR << "Failed to open file: " << filename;
+                    conn->send("Error: file not found\n");
+                    continue;
+                }
+
+                struct stat st;
+                if (::fstat(fd, &st) < 0)
+                {
+                    LOG_ERROR << "Failed to stat file: " << filename;
+                    ::close(fd);
+                    conn->send("Error: cannot stat file\n");
+                    continue;
+                }
+
+                LOG_INFO << "Sending file: " << filename << " size: " << st.st_size;
+                ssize_t bytesSent = co_await conn->sendFile(fd, 0, st.st_size);
+                ::close(fd);
+                LOG_INFO << "File sent, bytes: " << bytesSent;
             }
             // 如果收到 "sleep X"，则在协程中基于定时器挂起 X 秒，再回一条消息
             else if (msg.size() >= 6 && msg.substr(0, 5) == "sleep")
@@ -100,6 +131,22 @@ Task sessionHandler(std::shared_ptr<TcpConnection> conn)
                 LOG_INFO << "Coroutine sleep for " << seconds << " seconds";
                 co_await asyncSleep(conn, seconds);
                 conn->send("wake up after sleep\n");
+            }
+            else if (msg.size() >= 7 && msg.substr(0, 7) == "timeout")
+            {
+                conn->send("Waiting for your input (5 second timeout)...\n");
+                
+                auto [buf, timedOut] = co_await conn->readWithTimeout(5.0);
+                
+                if (timedOut)
+                {
+                    conn->send("Read timed out after 5 seconds!\n");
+                }
+                else
+                {
+                    std::string data = buf->retrieveAllAsString();
+                    conn->send("Received within timeout: " + data);
+                }
             }
             else
             {

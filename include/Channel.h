@@ -36,6 +36,9 @@ public:
     void setReadCoroutine(std::coroutine_handle<> h) { readCoroutine_ = h; }
     void clearReadCoroutine() { readCoroutine_ = nullptr; }
 
+    void setReadResumeCallback(std::function<void()> cb) { readResumeCallback_ = std::move(cb); }
+    void clearReadResumeCallback() { readResumeCallback_ = nullptr; }
+
     // 防止当channel被手动remove掉 channel还在执行回调操作
     void tie(const std::shared_ptr<void> &);
 
@@ -88,4 +91,5 @@ private:
 
     // [新增] 协程句柄
     std::coroutine_handle<> readCoroutine_ = nullptr;
+    std::function<void()> readResumeCallback_;
 };
