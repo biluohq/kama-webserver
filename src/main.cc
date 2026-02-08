@@ -148,6 +148,23 @@ Task sessionHandler(std::shared_ptr<TcpConnection> conn)
                     conn->send("Received within timeout: " + data);
                 }
             }
+            else if (msg.size() >= 8 && msg.substr(0, 8) == "bigwrite")
+            {
+                LOG_INFO << "Testing WriteAwaiter with backpressure control...";
+                conn->send("Starting bigwrite test (10 chunks of 1MB with 2MB high water mark)...\n");
+
+                std::string chunk(1024 * 1024, 'Y');
+                const size_t highWaterMark = 2 * 1024 * 1024;
+                
+                for (int i = 0; i < 10 && conn->connected(); ++i)
+                {
+                    LOG_INFO << "Writing chunk " << (i + 1) << "/10";
+                    size_t written = co_await conn->write(chunk, highWaterMark);
+                    LOG_INFO << "Chunk " << (i + 1) << " written: " << written << " bytes";
+                }
+
+                LOG_INFO << "bigwrite test completed.";
+            }
             else
             {
                 // 3. [普通逻辑] 简单的 Echo 回显

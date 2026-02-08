@@ -148,6 +148,36 @@ public:
         return ReadWithTimeoutAwaiter(this, timeoutSecs);
     }
 
+    // [WriteAwaiter]
+    // 用法: size_t written = co_await conn->write(data);
+    // 或: size_t written = co_await conn->write(data, 1024*1024); // 自定义高水位
+    // 带背压控制的写入，当输出缓冲区超过高水位时自动挂起
+    static constexpr size_t kDefaultHighWaterMark = 64 * 1024 * 1024;
+
+    struct WriteAwaiter
+    {
+        TcpConnection *conn_;
+        std::string data_;
+        size_t highWaterMark_;
+
+        WriteAwaiter(TcpConnection *conn, std::string data, size_t highWaterMark)
+            : conn_(conn), data_(std::move(data)), highWaterMark_(highWaterMark) {}
+
+        bool await_ready() const;
+        void await_suspend(std::coroutine_handle<> h);
+        size_t await_resume();
+    };
+
+    WriteAwaiter write(const std::string &data, size_t highWaterMark = kDefaultHighWaterMark)
+    {
+        return WriteAwaiter(this, data, highWaterMark);
+    }
+
+    WriteAwaiter write(std::string &&data, size_t highWaterMark = kDefaultHighWaterMark)
+    {
+        return WriteAwaiter(this, std::move(data), highWaterMark);
+    }
+
     // ================================================
 
     void setConnectionCallback(const ConnectionCallback &cb)
@@ -201,6 +231,7 @@ private:
 
     // 协程句柄 (取代了 std::function 回调)
     std::coroutine_handle<> writeCoroutine_ = nullptr;
+    size_t writeResumeThreshold_ = 0;
 
     int sendFileFd_ = -1;
     off_t sendFileOffset_ = 0;

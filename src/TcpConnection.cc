@@ -238,6 +238,31 @@ TcpConnection::ReadResult TcpConnection::ReadWithTimeoutAwaiter::await_resume()
     return {&conn_->inputBuffer_, false};
 }
 
+// ================= WriteAwaiter 实现 =================
+
+bool TcpConnection::WriteAwaiter::await_ready() const
+{
+    return conn_->outputBuffer_.readableBytes() < highWaterMark_ || !conn_->connected();
+}
+
+void TcpConnection::WriteAwaiter::await_suspend(std::coroutine_handle<> h)
+{
+    conn_->writeResumeThreshold_ = highWaterMark_ / 2;
+    conn_->writeCoroutine_ = h;
+    conn_->enableWriting();
+}
+
+size_t TcpConnection::WriteAwaiter::await_resume()
+{
+    if (!conn_->connected())
+    {
+        return 0;
+    }
+    size_t len = data_.size();
+    conn_->send(data_);
+    return len;
+}
+
 void TcpConnection::send(const std::string &buf)
 {
     LOG_DEBUG << "TcpConnection::send [" << name_.c_str()
@@ -484,19 +509,34 @@ void TcpConnection::handleWrite()
         if (n > 0)
         {
             outputBuffer_.retrieve(n);
-            if (outputBuffer_.readableBytes() == 0)
+            size_t remaining = outputBuffer_.readableBytes();
+
+            bool shouldResume = false;
+            if (writeResumeThreshold_ > 0)
+            {
+                shouldResume = (remaining <= writeResumeThreshold_);
+            }
+            else
+            {
+                shouldResume = (remaining == 0);
+            }
+
+            if (remaining == 0)
             {
                 channel_->disableWriting();
-                if (writeCoroutine_)
-                {
-                    auto co = writeCoroutine_;
-                    writeCoroutine_ = nullptr;
-                    co.resume();
-                }
-                if (state_ == kDisconnecting)
-                {
-                    shutdownInLoop();
-                }
+            }
+
+            if (shouldResume && writeCoroutine_)
+            {
+                writeResumeThreshold_ = 0;
+                auto co = writeCoroutine_;
+                writeCoroutine_ = nullptr;
+                co.resume();
+            }
+
+            if (remaining == 0 && state_ == kDisconnecting)
+            {
+                shutdownInLoop();
             }
         }
         else
